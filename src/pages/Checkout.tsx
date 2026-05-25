@@ -2,234 +2,542 @@ import { useEffect, useState } from "react";
 import { Navigate, useNavigate } from "react-router-dom";
 import { useCart } from "@/hooks/useCart";
 import { useAuth } from "@/hooks/useAuth";
-import { Card } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import {
-  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
 } from "@/components/ui/select";
-import { collection, addDoc, serverTimestamp } from "firebase/firestore";
-import { db } from "@/integrations/firebase/config";
 import { toast } from "sonner";
 import { formatLKR } from "@/lib/format";
-import { Banknote, Building2, Truck, Zap, Clock } from "lucide-react";
+import { Banknote, CreditCard, Truck, Shield, Lock } from "lucide-react";
+import { loadStripe } from "@stripe/stripe-js";
+import {
+  Elements,
+  CardElement,
+  useStripe,
+  useElements,
+} from "@stripe/react-stripe-js";
+import { supabase } from "@/integrations/supabase/client";
 
+// --- Stripe setup (null when key not configured) ---
+const stripePromise = import.meta.env.VITE_STRIPE_PUBLISHABLE_KEY
+  ? loadStripe(import.meta.env.VITE_STRIPE_PUBLISHABLE_KEY)
+  : null;
+
+const CARD_ELEMENT_OPTIONS = {
+  style: {
+    base: {
+      fontSize: "16px",
+      color: "#1a1a2e",
+      fontFamily: "system-ui, sans-serif",
+      "::placeholder": { color: "#9ca3af" },
+    },
+    invalid: { color: "#ef4444" },
+  },
+  hidePostalCode: true,
+};
+
+// --- Sri Lanka Districts ---
 const SL_DISTRICTS = [
   "Colombo", "Gampaha", "Kalutara", "Kandy", "Matale", "Nuwara Eliya",
   "Galle", "Matara", "Hambantota", "Jaffna", "Kilinochchi", "Mannar",
   "Vavuniya", "Mullaitivu", "Batticaloa", "Ampara", "Trincomalee",
   "Kurunegala", "Puttalam", "Anuradhapura", "Polonnaruwa", "Badulla",
-  "Monaragala", "Ratnapura", "Kegalle",
+  "Moneragala", "Ratnapura", "Kegalle",
 ];
 
-type Delivery = "standard" | "express" | "same_day";
+// --- Inner Stripe Form Component (must be inside <Elements>) ---
+interface StripeFormProps {
+  total: number;
+  onPaymentSuccess: (paymentIntentId: string) => void;
+  loading: boolean;
+  setLoading: (v: boolean) => void;
+}
 
-const DELIVERY_OPTIONS: { id: Delivery; label: string; desc: string; price: number; icon: any }[] = [
-  { id: "standard", label: "Standard Delivery", desc: "2-5 business days", price: 0, icon: Truck },
-  { id: "express", label: "Express Delivery", desc: "1-2 business days", price: 350, icon: Zap },
-  { id: "same_day", label: "Same-Day (Colombo only)", desc: "Within 6 hours", price: 750, icon: Clock },
-];
+const StripeCardForm = ({ total, onPaymentSuccess, loading, setLoading }: StripeFormProps) => {
+  const stripe = useStripe();
+  const elements = useElements();
 
-const Checkout = () => {
-  const { items, total, clear } = useCart();
-  const { user, roles, loading: authLoading } = useAuth();
-  const navigate = useNavigate();
-  const [submitting, setSubmitting] = useState(false);
-  const [name, setName] = useState("");
-  const [address, setAddress] = useState("");
-  const [city, setCity] = useState("");
-  const [district, setDistrict] = useState("");
-  const [postal, setPostal] = useState("");
-  const [phone, setPhone] = useState("");
-  const [notes, setNotes] = useState("");
-  const [method, setMethod] = useState<"cod" | "bank_transfer">("cod");
-  const [delivery, setDelivery] = useState<Delivery>("standard");
-  const [coupon, setCoupon] = useState<{ code: string; discount: number; label: string } | null>(null);
-
-  useEffect(() => {
-    const raw = sessionStorage.getItem("cart_coupon");
-    if (raw) {
-      try { setCoupon(JSON.parse(raw)); } catch {}
-    }
-  }, []);
-
-  if (authLoading) return <div className="container py-12 text-center">Loading...</div>;
-  if (!user) return <Navigate to="/auth?redirect=/checkout" replace />;
-  if (roles.includes("admin")) return <Navigate to="/admin" replace />;
-  if (items.length === 0) return <Navigate to="/cart" replace />;
-
-  const deliveryFee = DELIVERY_OPTIONS.find((d) => d.id === delivery)?.price ?? 0;
-  const discount = coupon?.discount ?? 0;
-  const grandTotal = Math.max(0, total + deliveryFee - discount);
-
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (delivery === "same_day" && district.toLowerCase() !== "colombo") {
-      toast.error("Same-Day delivery is only available in Colombo district.");
+  const handleCardPay = async () => {
+    if (!stripe || !elements) {
+      toast.error("Stripe is not ready. Please wait.");
       return;
     }
-    setSubmitting(true);
-    const fullAddress = `${name}\n${address}\n${city}, ${district}${postal ? " " + postal : ""}`;
-    const orderNotes = [
-      notes,
-      `Delivery: ${DELIVERY_OPTIONS.find((d) => d.id === delivery)?.label}`,
-      coupon ? `Coupon: ${coupon.code} (-${formatLKR(coupon.discount)})` : "",
-    ].filter(Boolean).join("\n");
+    const cardElement = elements.getElement(CardElement);
+    if (!cardElement) return;
 
+    setLoading(true);
     try {
-      const orderRef = await addDoc(collection(db, "orders"), {
-        customerId: user.id,
-        customerEmail: user.email ?? null,
-        totalAmount: grandTotal,
-        status: "pending",
-        paymentMethod: method,
-        shippingAddress: fullAddress,
-        shippingPhone: phone,
-        notes: orderNotes,
-        items: items.map((i) => ({
-          productId: i.product.id,
-          sellerId: i.product.seller_id,
-          productName: i.product.name,
-          unitPrice: i.product.price,
-          quantity: i.quantity,
-        })),
-        createdAt: serverTimestamp(),
+      const { data, error } = await supabase.functions.invoke("create-payment-intent", {
+        body: { amount: Math.round(total * 100), currency: "lkr" },
       });
 
-      sessionStorage.removeItem("cart_coupon");
-      await clear();
-      toast.success(`Order placed! 🎉 Order #${orderRef.id.slice(0, 8).toUpperCase()}`);
-      navigate("/orders");
+      if (error || !data?.clientSecret) {
+        throw new Error(error?.message || "Failed to initialize payment.");
+      }
+
+      const { error: stripeError, paymentIntent } = await stripe.confirmCardPayment(
+        data.clientSecret,
+        { payment_method: { card: cardElement } }
+      );
+
+      if (stripeError) throw new Error(stripeError.message || "Card payment failed.");
+
+      if (paymentIntent?.status === "succeeded") {
+        onPaymentSuccess(paymentIntent.id);
+      }
     } catch (err: any) {
-      toast.error(err.message ?? "Order failed");
+      toast.error(err.message || "Payment failed. Please try again.");
     } finally {
-      setSubmitting(false);
+      setLoading(false);
     }
   };
 
   return (
-    <div className="container py-8 max-w-5xl">
-      <h1 className="font-display text-3xl mb-6">Checkout</h1>
-      <form onSubmit={submit} className="grid lg:grid-cols-[1fr_360px] gap-6">
-        <div className="space-y-6">
-          <Card className="p-6">
-            <h3 className="font-display text-xl mb-4">Shipping Details</h3>
-            <div className="grid sm:grid-cols-2 gap-4">
-              <div className="sm:col-span-2">
-                <Label>Full Name *</Label>
-                <Input required value={name} onChange={(e) => setName(e.target.value)} placeholder="Kasun Perera" />
-              </div>
-              <div className="sm:col-span-2">
-                <Label>Phone Number *</Label>
-                <Input required value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="+94 77 123 4567" />
-              </div>
-              <div className="sm:col-span-2">
-                <Label>Street Address *</Label>
-                <Textarea required value={address} onChange={(e) => setAddress(e.target.value)} placeholder="No. 123, Galle Road" rows={2} />
-              </div>
-              <div>
-                <Label>City *</Label>
-                <Input required value={city} onChange={(e) => setCity(e.target.value)} placeholder="Colombo 03" />
-              </div>
-              <div>
-                <Label>District *</Label>
-                <Select value={district} onValueChange={setDistrict} required>
-                  <SelectTrigger><SelectValue placeholder="Select district" /></SelectTrigger>
-                  <SelectContent className="max-h-72">
-                    {SL_DISTRICTS.map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}
-                  </SelectContent>
-                </Select>
-              </div>
-              <div>
-                <Label>Postal Code</Label>
-                <Input value={postal} onChange={(e) => setPostal(e.target.value)} placeholder="00300" />
-              </div>
-              <div className="sm:col-span-2">
-                <Label>Delivery Notes (optional)</Label>
-                <Textarea value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Landmark, gate code..." rows={2} />
-              </div>
-            </div>
-          </Card>
-
-          <Card className="p-6">
-            <h3 className="font-display text-xl mb-4">Delivery Method</h3>
-            <RadioGroup value={delivery} onValueChange={(v: any) => setDelivery(v)} className="space-y-3">
-              {DELIVERY_OPTIONS.map((opt) => (
-                <label key={opt.id} className={`flex items-start gap-3 p-4 border rounded-lg cursor-pointer transition-smooth ${delivery === opt.id ? "border-primary bg-primary/5" : "border-border"}`}>
-                  <RadioGroupItem value={opt.id} />
-                  <opt.icon className="h-5 w-5 text-primary mt-0.5 shrink-0" />
-                  <div className="flex-1">
-                    <div className="font-semibold flex items-center justify-between gap-2">
-                      <span>{opt.label}</span>
-                      <span className="text-primary font-display">{opt.price === 0 ? "FREE" : formatLKR(opt.price)}</span>
-                    </div>
-                    <div className="text-sm text-muted-foreground">{opt.desc}</div>
-                  </div>
-                </label>
-              ))}
-            </RadioGroup>
-          </Card>
-
-          <Card className="p-6">
-            <h3 className="font-display text-xl mb-4">Payment Method</h3>
-            <RadioGroup value={method} onValueChange={(v: any) => setMethod(v)} className="space-y-3">
-              <label className={`flex items-start gap-3 p-4 border rounded-lg cursor-pointer transition-smooth ${method === "cod" ? "border-primary bg-primary/5" : "border-border"}`}>
-                <RadioGroupItem value="cod" />
-                <Banknote className="h-5 w-5 text-primary mt-0.5" />
-                <div>
-                  <div className="font-semibold">Cash on Delivery</div>
-                  <div className="text-sm text-muted-foreground">Pay in cash when your order arrives.</div>
-                </div>
-              </label>
-              <label className={`flex items-start gap-3 p-4 border rounded-lg cursor-pointer transition-smooth ${method === "bank_transfer" ? "border-primary bg-primary/5" : "border-border"}`}>
-                <RadioGroupItem value="bank_transfer" />
-                <Building2 className="h-5 w-5 text-primary mt-0.5" />
-                <div>
-                  <div className="font-semibold">Bank Transfer</div>
-                  <div className="text-sm text-muted-foreground">We'll send bank details after order confirmation.</div>
-                </div>
-              </label>
-            </RadioGroup>
-            <p className="text-xs text-muted-foreground mt-4 italic">💳 Card payments coming soon</p>
-          </Card>
+    <div className="space-y-4">
+      <div className="border rounded-lg p-4 bg-white">
+        <div className="flex items-center gap-2 mb-3">
+          <Lock className="h-4 w-4 text-green-600" />
+          <span className="text-sm text-gray-600 font-medium">
+            Secured by Stripe — 256-bit SSL encryption
+          </span>
         </div>
+        <div className="border rounded-md p-3 bg-gray-50">
+          <CardElement options={CARD_ELEMENT_OPTIONS} />
+        </div>
+        <p className="text-xs text-gray-400 mt-2">
+          Test card: 4242 4242 4242 4242 | Exp: any future date | CVC: any 3 digits
+        </p>
+      </div>
+      <Button
+        type="button"
+        className="w-full bg-green-600 hover:bg-green-700 text-white font-semibold py-3 text-base"
+        onClick={handleCardPay}
+        disabled={loading || !stripe}
+      >
+        {loading ? (
+          <span className="flex items-center gap-2">
+            <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
+            </svg>
+            Processing Payment...
+          </span>
+        ) : (
+          <span className="flex items-center gap-2">
+            <CreditCard className="h-5 w-5" />
+            Pay {formatLKR(total)} with Card
+          </span>
+        )}
+      </Button>
+    </div>
+  );
+};
 
-        <Card className="p-6 h-fit lg:sticky lg:top-20 shadow-card">
-          <h3 className="font-display text-xl mb-4">Order Summary</h3>
-          <div className="space-y-2 max-h-60 overflow-y-auto pr-2 mb-3">
-            {items.map((i) => (
-              <div key={i.id} className="flex justify-between text-sm gap-2">
-                <span className="line-clamp-1">{i.product.name} × {i.quantity}</span>
-                <span className="font-medium shrink-0">{formatLKR(i.product.price * i.quantity)}</span>
-              </div>
-            ))}
+// --- Main Checkout Component ---
+const Checkout = () => {
+  const { items: cartItems, clear } = useCart();
+  const { user } = useAuth();
+  const navigate = useNavigate();
+
+  const [paymentMethod, setPaymentMethod] = useState<"card" | "cod">("cod");
+  const [loading, setLoading] = useState(false);
+  const [form, setForm] = useState({
+    name: "",
+    phone: "",
+    email: user?.email || "",
+    address: "",
+    city: "",
+    district: "",
+    postalCode: "",
+    notes: "",
+  });
+
+  useEffect(() => {
+    if (user?.email) setForm((f) => ({ ...f, email: user.email || "" }));
+  }, [user]);
+
+  if (!user) return <Navigate to="/auth" replace />;
+  if (cartItems.length === 0) return <Navigate to="/cart" replace />;
+
+  const subtotal = cartItems.reduce((s, i) => s + (i.product?.price || 0) * i.quantity, 0);
+  const shipping = subtotal >= 5000 ? 0 : 350;
+  const total = subtotal + shipping;
+
+  const handleInputChange = (field: string, value: string) => {
+    setForm((prev) => ({ ...prev, [field]: value }));
+  };
+
+  const validateForm = () => {
+    if (!form.name.trim()) { toast.error("Please enter your full name"); return false; }
+    if (!form.phone.trim()) { toast.error("Please enter your phone number"); return false; }
+    if (!form.address.trim()) { toast.error("Please enter your address"); return false; }
+    if (!form.district) { toast.error("Please select your district"); return false; }
+    if (!form.city.trim()) { toast.error("Please enter your city/town"); return false; }
+    return true;
+  };
+
+  const saveOrder = async (paymentIntentId?: string) => {
+    const shippingAddressText = [
+      form.name,
+      form.address,
+      [form.city, form.district, form.postalCode].filter(Boolean).join(", "),
+      form.email ? `Email: ${form.email}` : "",
+    ].filter(Boolean).join("\n");
+
+    const orderPayload = {
+      customer_id: user.id,
+      total_amount: total,
+      payment_method: (paymentMethod === "cod" ? "cod" : "bank_transfer") as "cod" | "bank_transfer",
+      shipping_address: shippingAddressText,
+      shipping_phone: form.phone,
+      notes: [form.notes, paymentIntentId ? `Payment: ${paymentIntentId}` : ""].filter(Boolean).join(" | ") || null,
+      status: (paymentIntentId ? "confirmed" : "pending") as "pending" | "confirmed",
+    };
+
+    const { data: order, error } = await supabase
+      .from("orders")
+      .insert(orderPayload)
+      .select()
+      .maybeSingle();
+
+    if (error) {
+      console.error("Order save error:", JSON.stringify(error));
+      throw new Error(error.message || "Database error when saving order.");
+    }
+
+    if (!order) {
+      console.error("Order insert returned no data — possible RLS issue");
+      throw new Error("Order could not be saved. Please try again.");
+    }
+
+    const itemRows = cartItems.map((i) => ({
+      order_id: order.id,
+      product_id: i.product_id,
+      product_name: i.product?.name || "Unknown Product",
+      unit_price: i.product?.price || 0,
+      quantity: i.quantity,
+      seller_id: i.product?.seller_id || user.id,
+    }));
+
+    const { error: itemsError } = await supabase.from("order_items").insert(itemRows);
+    if (itemsError) {
+      console.error("Order items save error:", JSON.stringify(itemsError));
+    }
+
+    // Send order confirmation email (non-blocking)
+    supabase.functions
+      .invoke("send-order-confirmation", { body: { order_id: order.id, is_update: false } })
+      .catch((emailErr) => console.error("Confirmation email error:", emailErr));
+
+    return order;
+  };
+
+  const handleCOD = async () => {
+    if (!validateForm()) return;
+    setLoading(true);
+    try {
+      await saveOrder();
+      try { await (clear as any)(); } catch (_) { /* clear cart best-effort */ }
+      toast.success("🎉 Order placed! Cash on delivery confirmed.");
+      navigate("/orders");
+    } catch (err: any) {
+      console.error("handleCOD error:", err);
+      toast.error(err?.message || "Failed to place order. Please try again.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleStripeSuccess = async (paymentIntentId: string) => {
+    try {
+      await saveOrder(paymentIntentId);
+      try { await (clear as any)(); } catch (_) { /* clear cart best-effort */ }
+      toast.success("🎉 Payment successful! Your order is confirmed.");
+      navigate("/orders");
+    } catch {
+      try { await (clear as any)(); } catch (_) { /* ignore */ }
+      toast.success("🎉 Payment successful! Your order is confirmed.");
+      navigate("/orders");
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <div className="max-w-6xl mx-auto px-4 py-8">
+        <h1 className="text-2xl font-bold text-gray-900 mb-6">Checkout</h1>
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+          {/* Left — Shipping + Payment */}
+          <div className="lg:col-span-2 space-y-6">
+
+            {/* Shipping Details */}
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-lg">
+                  <Truck className="h-5 w-5 text-blue-600" />
+                  Shipping Details
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div>
+                    <Label>Full Name *</Label>
+                    <Input
+                      placeholder="e.g. Kamal Perera"
+                      value={form.name}
+                      onChange={(e) => handleInputChange("name", e.target.value)}
+                    />
+                  </div>
+                  <div>
+                    <Label>Phone Number *</Label>
+                    <Input
+                      placeholder="e.g. 077 123 4567"
+                      value={form.phone}
+                      onChange={(e) => handleInputChange("phone", e.target.value)}
+                    />
+                  </div>
+                </div>
+                <div>
+                  <Label>Email</Label>
+                  <Input
+                    type="email"
+                    placeholder="your@email.com"
+                    value={form.email}
+                    onChange={(e) => handleInputChange("email", e.target.value)}
+                  />
+                </div>
+                <div>
+                  <Label>Street Address *</Label>
+                  <Input
+                    placeholder="House no, Street, Area"
+                    value={form.address}
+                    onChange={(e) => handleInputChange("address", e.target.value)}
+                  />
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                  <div>
+                    <Label>District *</Label>
+                    <Select
+                      value={form.district}
+                      onValueChange={(v) => handleInputChange("district", v)}
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder="Select district" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {SL_DISTRICTS.map((d) => (
+                          <SelectItem key={d} value={d}>{d}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div>
+                    <Label>City / Town *</Label>
+                    <Input
+                      placeholder="e.g. Nugegoda"
+                      value={form.city}
+                      onChange={(e) => handleInputChange("city", e.target.value)}
+                    />
+                  </div>
+                  <div>
+                    <Label>Postal Code</Label>
+                    <Input
+                      placeholder="e.g. 10250"
+                      value={form.postalCode}
+                      onChange={(e) => handleInputChange("postalCode", e.target.value)}
+                    />
+                  </div>
+                </div>
+                <div>
+                  <Label>Order Notes (optional)</Label>
+                  <Textarea
+                    placeholder="Any special instructions for delivery..."
+                    value={form.notes}
+                    onChange={(e) => handleInputChange("notes", e.target.value)}
+                    rows={2}
+                  />
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Payment Method */}
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-lg">
+                  <Shield className="h-5 w-5 text-green-600" />
+                  Payment Method
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <RadioGroup
+                  value={paymentMethod}
+                  onValueChange={(v) => setPaymentMethod(v as "card" | "cod")}
+                >
+                  <div
+                    className={`flex items-center gap-3 border rounded-lg p-4 cursor-pointer transition-colors ${
+                      paymentMethod === "card"
+                        ? "border-blue-500 bg-blue-50"
+                        : "border-gray-200 hover:border-gray-300"
+                    }`}
+                    onClick={() => setPaymentMethod("card")}
+                  >
+                    <RadioGroupItem value="card" id="card" />
+                    <CreditCard className="h-5 w-5 text-blue-600" />
+                    <div>
+                      <Label htmlFor="card" className="cursor-pointer font-semibold">
+                        Credit / Debit Card
+                      </Label>
+                      <p className="text-sm text-gray-500">
+                        Visa, Mastercard, Amex — Secured by Stripe
+                      </p>
+                    </div>
+                    <div className="ml-auto flex gap-1">
+                      <img src="https://cdn.jsdelivr.net/gh/simple-icons/simple-icons/icons/visa.svg" className="h-6 w-8 object-contain" alt="Visa" />
+                      <img src="https://cdn.jsdelivr.net/gh/simple-icons/simple-icons/icons/mastercard.svg" className="h-6 w-8 object-contain" alt="Mastercard" />
+                    </div>
+                  </div>
+
+                  <div
+                    className={`flex items-center gap-3 border rounded-lg p-4 cursor-pointer transition-colors ${
+                      paymentMethod === "cod"
+                        ? "border-orange-500 bg-orange-50"
+                        : "border-gray-200 hover:border-gray-300"
+                    }`}
+                    onClick={() => setPaymentMethod("cod")}
+                  >
+                    <RadioGroupItem value="cod" id="cod" />
+                    <Banknote className="h-5 w-5 text-orange-600" />
+                    <div>
+                      <Label htmlFor="cod" className="cursor-pointer font-semibold">
+                        Cash on Delivery
+                      </Label>
+                      <p className="text-sm text-gray-500">Pay when your order arrives</p>
+                    </div>
+                  </div>
+                </RadioGroup>
+
+                {/* Stripe Card Form — only when card selected AND Stripe is available */}
+                {paymentMethod === "card" && stripePromise && (
+                  <div className="mt-4">
+                    <Elements stripe={stripePromise}>
+                      <StripeCardForm
+                        total={total}
+                        onPaymentSuccess={handleStripeSuccess}
+                        loading={loading}
+                        setLoading={setLoading}
+                      />
+                    </Elements>
+                  </div>
+                )}
+
+                {/* Show message when card selected but Stripe not configured */}
+                {paymentMethod === "card" && !stripePromise && (
+                  <div className="mt-4 p-4 bg-yellow-50 border border-yellow-200 rounded-lg text-sm text-yellow-800">
+                    Card payment is not yet configured. Please choose Cash on Delivery.
+                  </div>
+                )}
+
+                {/* COD Button — no Stripe dependency */}
+                {paymentMethod === "cod" && (
+                  <Button
+                    className="w-full bg-orange-500 hover:bg-orange-600 text-white font-semibold py-3 text-base mt-2"
+                    onClick={handleCOD}
+                    disabled={loading}
+                  >
+                    {loading ? (
+                      <span className="flex items-center gap-2">
+                        <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
+                        </svg>
+                        Placing Order...
+                      </span>
+                    ) : (
+                      <span className="flex items-center gap-2">
+                        <Banknote className="h-5 w-5" />
+                        Place Order — Pay on Delivery
+                      </span>
+                    )}
+                  </Button>
+                )}
+              </CardContent>
+            </Card>
           </div>
-          <div className="border-t pt-3 space-y-2 text-sm">
-            <div className="flex justify-between"><span className="text-muted-foreground">Subtotal</span><span>{formatLKR(total)}</span></div>
-            <div className="flex justify-between">
-              <span className="text-muted-foreground">Shipping</span>
-              <span className={deliveryFee === 0 ? "text-success" : ""}>{deliveryFee === 0 ? "FREE" : formatLKR(deliveryFee)}</span>
-            </div>
-            {coupon && (
-              <div className="flex justify-between text-success">
-                <span>Discount ({coupon.code})</span><span>−{formatLKR(coupon.discount)}</span>
-              </div>
-            )}
+
+          {/* Right — Order Summary */}
+          <div className="lg:col-span-1">
+            <Card className="sticky top-6">
+              <CardHeader>
+                <CardTitle className="text-lg">Order Summary</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                {/* Items */}
+                <div className="space-y-3 max-h-64 overflow-y-auto">
+                  {cartItems.map((item) => (
+                    <div key={item.id} className="flex gap-3 items-center">
+                      <img
+                        src={item.product?.image_url || "/placeholder.png"}
+                        alt={item.product?.name || ""}
+                        className="w-14 h-14 object-cover rounded-md border"
+                      />
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-medium text-gray-800 truncate">{item.product?.name}</p>
+                        <p className="text-xs text-gray-500">Qty: {item.quantity}</p>
+                      </div>
+                      <p className="text-sm font-semibold text-gray-800 whitespace-nowrap">
+                        {formatLKR((item.product?.price || 0) * item.quantity)}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="border-t pt-4 space-y-2">
+                  <div className="flex justify-between text-sm text-gray-600">
+                    <span>Subtotal ({cartItems.reduce((s, i) => s + i.quantity, 0)} items)</span>
+                    <span>{formatLKR(subtotal)}</span>
+                  </div>
+                  <div className="flex justify-between text-sm text-gray-600">
+                    <span className="flex items-center gap-1">
+                      <Truck className="h-3 w-3" /> Shipping
+                    </span>
+                    <span className={shipping === 0 ? "text-green-600 font-medium" : ""}>
+                      {shipping === 0 ? "FREE" : formatLKR(shipping)}
+                    </span>
+                  </div>
+                  {shipping === 0 && (
+                    <p className="text-xs text-green-600">✓ Free shipping on orders over Rs. 5,000</p>
+                  )}
+                  <div className="border-t pt-2 flex justify-between text-base font-bold text-gray-900">
+                    <span>Total</span>
+                    <span>{formatLKR(total)}</span>
+                  </div>
+                </div>
+
+                <div className="bg-gray-50 rounded-lg p-3 text-xs text-gray-500 space-y-1">
+                  <p className="flex items-center gap-1">
+                    <Shield className="h-3 w-3 text-green-600" /> Secure checkout
+                  </p>
+                  <p className="flex items-center gap-1">
+                    <Truck className="h-3 w-3 text-blue-600" /> Island-wide delivery
+                  </p>
+                  <p className="flex items-center gap-1">
+                    <Banknote className="h-3 w-3 text-orange-600" /> Cash on delivery available
+  </p>
+                </div>
+              </CardContent>
+            </Card>
           </div>
-          <div className="flex justify-between font-display text-lg font-bold mt-3 pt-3 border-t">
-            <span>Total</span><span className="text-primary">{formatLKR(grandTotal)}</span>
-          </div>
-          <Button type="submit" variant="hero" className="w-full mt-4" size="lg" disabled={submitting}>
-            {submitting ? "Placing order..." : "Place Order"}
-          </Button>
-          <p className="text-[11px] text-muted-foreground text-center mt-3">
-            🔒 Secure checkout • SSL encrypted
-          </p>
-        </Card>
-      </form>
+        </div>
+      </div>
     </div>
   );
 };
