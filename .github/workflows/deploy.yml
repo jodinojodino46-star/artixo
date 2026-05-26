@@ -32,11 +32,12 @@ jobs:
 
       - name: Build
         env:
+          VITE_BASE_PATH: /artixo/
           VITE_PAYHERE_SANDBOX: "true"
           VITE_PAYHERE_MERCHANT_ID: ${{ secrets.VITE_PAYHERE_MERCHANT_ID }}
           VITE_PAYHERE_NOTIFY_URL: ${{ secrets.VITE_PAYHERE_NOTIFY_URL }}
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
-          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          VITE_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY }}
         run: npm run build
 
       - name: Upload artifact
